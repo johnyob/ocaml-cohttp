@@ -24,6 +24,7 @@ val to_string_list : t -> string list Lwt.t
 val to_stream : t -> string Lwt_stream.t
 val of_stream : string Lwt_stream.t -> t
 val to_form : t -> (string * string list) list Lwt.t
+val closed : t -> unit Lwt.t
 
 val create_stream :
   ('a -> Cohttp.Transfer.chunk Lwt.t) -> 'a -> string Lwt_stream.t

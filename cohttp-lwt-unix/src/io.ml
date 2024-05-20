@@ -80,3 +80,24 @@ let catch f =
     | ex -> Lwt.fail ex)
 
 let pp_error = Fmt.exn
+
+let has_recv_eof fd =
+  let bytes = Bytes.create 1 in
+  Lwt.(Lwt_unix.recv fd bytes 0 1 Unix.[ MSG_PEEK ] >|= fun n -> n = 0)
+
+let wait_eof_or_closed conn ic =
+  let open Lwt.Infix in
+  let fd =
+    match conn with
+    | Conduit_lwt_unix.TCP { fd; _ } -> fd
+    | Domain_socket { fd; _ } -> fd
+    | Vchan _ -> assert false
+  in
+  let rec loop () =
+    if Lwt_io.is_closed ic then Lwt.return_unit
+    else
+      has_recv_eof fd >>= function
+      | true -> Lwt.return_unit
+      | false -> Lwt.pause () >>= loop
+  in
+  loop ()

@@ -64,6 +64,11 @@ let to_stream (body : t) =
   | `String s -> Lwt_stream.of_list [ s ]
   | `Strings sl -> Lwt_stream.of_list sl
 
+let closed (body : t) =
+  match body with
+  | `Empty | `String _ | `Strings _ -> return_unit
+  | `Stream s -> Lwt_stream.closed s
+
 let drain_body (body : t) =
   match body with
   | `Empty | `String _ | `Strings _ -> return_unit

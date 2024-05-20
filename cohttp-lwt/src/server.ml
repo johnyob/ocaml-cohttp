@@ -95,59 +95,85 @@ module Make (IO : S.IO) = struct
         Body.of_stream body_stream
     | `No | `Unknown -> `Empty
 
-  let handle_request callback conn req body =
+  let handle_request callback conn req req_body =
     Log.debug (fun m -> m "Handle request: %a." Request.pp_hum req);
-    Lwt.finalize
-      (fun () ->
-        Lwt.catch
-          (fun () -> callback conn req body)
-          (function
-            | Out_of_memory -> Lwt.fail Out_of_memory
-            | exn ->
-                Log.err (fun f ->
-                    f "Error handling %a: %s" Request.pp_hum req
-                      (Printexc.to_string exn));
-                respond_error ~body:"Internal Server Error" () >|= fun rsp ->
-                `Response rsp))
-      (fun () -> Body.drain_body body)
+    Lwt.catch
+      (fun () -> callback conn req req_body)
+      (function
+        | Out_of_memory -> Lwt.fail Out_of_memory
+        | exn ->
+            Log.err (fun f ->
+                f "Error handling %a: %s" Request.pp_hum req
+                  (Printexc.to_string exn));
+            respond_error ~body:"Internal Server Error" () >|= fun rsp ->
+            `Response rsp)
 
-  let handle_response ~keep_alive oc res body conn_closed handle_client =
-    IO.catch (fun () ->
-        let flush = Response.flush res in
-        Response.write ~flush
-          (fun writer -> Body.write_body (Response.write_body writer) body)
-          res oc)
-    >>= function
-    | Ok () ->
-        if keep_alive then handle_client oc
-        else
-          let () = conn_closed () in
-          Lwt.return_unit
-    | Error e ->
-        Log.info (fun m -> m "IO error while writing body: %a" IO.pp_error e);
+  let handle_response ~keep_alive ~conn_closed ic oc = function
+    | `Expert (res, io_handler) ->
+        Response.write_header res oc >>= fun () -> io_handler ic oc
+    | `Response (res, res_body) -> (
+        IO.catch (fun () ->
+            let res =
+              let headers =
+                Cohttp.Header.add_unless_exists
+                  (Cohttp.Response.headers res)
+                  "connection"
+                  (if keep_alive then "keep-alive" else "close")
+              in
+              { res with Response.headers }
+            in
+            let flush = Response.flush res in
+            Response.write ~flush
+              (fun writer ->
+                Body.write_body (Response.write_body writer) res_body)
+              res oc)
+        >>= function
+        | Error e ->
+            Log.info (fun m ->
+                m "IO error while writing response: %a" IO.pp_error e);
+            conn_closed ();
+            Body.drain_body res_body
+        | Ok () ->
+            if keep_alive then IO.flush oc
+            else (
+              conn_closed ();
+              Lwt.return_unit))
+
+  let handle_client ic oc conn spec =
+    let conn_closed () = spec.conn_closed conn in
+    let responses =
+      let last_body_closed = ref Lwt.return_unit in
+      let eof () =
         conn_closed ();
-        Body.drain_body body
-
-  let rec handle_client ic oc conn spec =
-    Request.read ic >>= function
-    | `Eof ->
-        spec.conn_closed conn;
-        Lwt.return_unit
-    | `Invalid data ->
-        Log.err (fun m -> m "invalid input %s while handling client" data);
-        spec.conn_closed conn;
-        Lwt.return_unit
-    | `Ok req -> (
-        let body = read_body ic req in
-        handle_request spec.callback conn req body >>= function
-        | `Response (res, body) ->
-            let keep_alive = Request.is_keep_alive req in
-            handle_response ~keep_alive oc res body
-              (fun () -> spec.conn_closed conn)
-              (fun oc -> handle_client ic oc conn spec)
-        | `Expert (res, io_handler) ->
-            Response.write_header res oc >>= fun () ->
-            io_handler ic oc >>= fun () -> handle_client ic oc conn spec)
+        Lwt.return None
+      in
+      Lwt_stream.from (fun () ->
+          !last_body_closed >>= fun () ->
+          Request.read ic >>= function
+          | `Eof | `Invalid _ -> eof ()
+          | `Ok req ->
+              let req_body = read_body ic req in
+              (* There are scenarios if the client closes the connection before the
+                 request is handled. This may cause leaks if [handle_request] never
+                 resolves. *)
+              Lwt.pick
+                [
+                  IO.wait_eof_or_closed (fst conn) ic >>= eof;
+                  ( handle_request spec.callback conn req req_body >|= fun res ->
+                    last_body_closed := Body.closed req_body;
+                    Some (req, req_body, res) );
+                ])
+    in
+    Lwt_stream.iter_s
+      (fun (req, req_body, res) ->
+        let drain_body_after f =
+          Lwt.finalize f (fun () -> Body.drain_body req_body)
+        in
+        drain_body_after (fun () ->
+            handle_response
+              ~keep_alive:(Request.is_keep_alive req)
+              ~conn_closed ic oc res))
+      responses
 
   let callback spec io_id ic oc =
     let conn_id = Cohttp.Connection.create () in
